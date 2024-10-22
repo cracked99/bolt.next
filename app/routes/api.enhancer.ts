@@ -6,12 +6,22 @@ import { stripIndents } from '~/utils/stripIndent';
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
+// Simple in-memory cache
+const cache = new Map<string, { data: string; timestamp: number }>();
+const CACHE_EXPIRATION = 5 * 60 * 1000; // 5 minutes
+
 export async function action(args: ActionFunctionArgs) {
   return enhancerAction(args);
 }
 
 async function enhancerAction({ context, request }: ActionFunctionArgs) {
   const { message } = await request.json<{ message: string }>();
+
+  // Check cache
+  const cachedResult = checkCache(message);
+  if (cachedResult) {
+    return new Response(cachedResult);
+  }
 
   try {
     const result = await streamText(
@@ -32,6 +42,8 @@ async function enhancerAction({ context, request }: ActionFunctionArgs) {
       context.cloudflare.env,
     );
 
+    let fullResponse = '';
+
     const transformStream = new TransformStream({
       transform(chunk, controller) {
         const processedChunk = decoder
@@ -42,11 +54,19 @@ async function enhancerAction({ context, request }: ActionFunctionArgs) {
           .map((part) => part.value)
           .join('');
 
+        fullResponse += processedChunk;
         controller.enqueue(encoder.encode(processedChunk));
       },
     });
 
     const transformedStream = result.toAIStream().pipeThrough(transformStream);
+
+    // Cache the full response after the stream is complete
+    transformedStream.pipeTo(new WritableStream({
+      close() {
+        cacheResult(message, fullResponse);
+      }
+    }));
 
     return new StreamingTextResponse(transformedStream);
   } catch (error) {
@@ -57,4 +77,16 @@ async function enhancerAction({ context, request }: ActionFunctionArgs) {
       statusText: 'Internal Server Error',
     });
   }
+}
+
+function checkCache(key: string): string | null {
+  const cached = cache.get(key);
+  if (cached && Date.now() - cached.timestamp < CACHE_EXPIRATION) {
+    return cached.data;
+  }
+  return null;
+}
+
+function cacheResult(key: string, data: string) {
+  cache.set(key, { data, timestamp: Date.now() });
 }
